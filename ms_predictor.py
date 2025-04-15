@@ -25,9 +25,8 @@ from glob import glob
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
-import numpy as np
 from misc import data_augment, count_parameters, torchify
-from dataset import load_spectral_data, dataset_dict_to_dense
+from dataset import load_spectral_data, dataset_dict_to_dense, augment_mix
 
 np.random.seed(args.seed*543246)
 
@@ -41,19 +40,22 @@ import torch
 
 # Training data
 from scipy.signal import savgol_filter
-dataset_dict = load_spectral_data([
-    "./raw_data/DataDavid/UVVIS/*.asc",
-    "./raw_data/DataHenry23/Perkin/New_*/*.asc",
-    "./raw_data/DataJulie/07_09_spectro/**/*.asc",
-    "./raw_data/DataJulie/14_09_2023/*.asc",
-    "./raw_data/DataJulie/11_09_2023/*.asc",
-    "./raw_data/DataJulie/14_09_2023_histo/*.asc",
-    "./raw_data/DataJulie/historique/*.asc",
-], verbose=True)
+validation_indices = list()
+with open("data.txt") as f:
+    lines = f.read().splitlines()
+    sources = list()
+    for line in lines:
+        if "VALIDATION" in line:
+            validation_indices.extend(map(int, line.split()[1:]))
+        if not line.startswith("#"):
+            sources.append(line)
+    dataset_dict = load_spectral_data(sources, verbose=True)
 
 # We label the dataset and convert it to numpy arrays
 X, Y = dataset_dict_to_dense(dataset_dict)
-
+histo_mask = np.zeros_like(Y[:, 0], dtype=bool)
+for v in validation_indices:
+    histo_mask |= (Y[:, 0] == v)
 # Build the wavelength vector
 wavelength = np.flipud(np.linspace(250, 2500, 226))
 # Wavelengths above 2300nm are removed because of low SNR
@@ -76,6 +78,8 @@ if args.action =="savgol":
     del Xr
 
 
+#X, Y =  augment_mix(X, Y, added=100)
+
 if args.cwt is not None:
     from scipy.signal import cwt, ricker
     def do_cwt(data, octaves=128, offset=1, stridesf=1, stridesx=1):
@@ -84,7 +88,11 @@ if args.cwt is not None:
             cwts.append(cwt(data[i], wavelet=ricker, widths=np.arange(offset+1, offset+octaves+1)))
         cwts = np.asarray(cwts) / 5
         return np.abs(cwts[:, ::stridesf, ::stridesx]).real #[:, offset:offset+octaves]
-
+    # augment x 
+    #X = np.asarray([ data_augment(X) for i in range(5)]).reshape(-1, X.shape[-1])
+    #valid_mask =np.tile(valid_mask, 5)
+    #Y = np.tile(Y, (5,1))
+    #print(X.shape, Y.shape)
     X = do_cwt(X, octaves=args.cwt[0], offset=args.cwt[1], stridesf=args.cwt[2], stridesx=args.cwt[3])
 
 # StandardScaling
@@ -94,7 +102,7 @@ X = (X - dsmean) / dsstd
 
 if args.validation == "historical":
     # Separate every single historic parchment and put them in validation (sets 12 and 13).
-    valid_mask = np.logical_or(Y[:, 0] == 13, Y[:, 0] == 12)
+    valid_mask = histo_mask
     # Train/Test split
     Xv = X[valid_mask]
     Yv = Y[valid_mask]
@@ -134,6 +142,7 @@ Yv = Yv[Yv[:,5]< 4,:]
 
 labels_t = Yt[:, 1]
 labels_v = Yv[:, 1]
+
 
 print("Samples per class: ", [np.count_nonzero(labels_t == i) for i in range(3)])
 
@@ -320,6 +329,7 @@ if args.action == "train":
     print("Training model")
     losses, losses_t, accs, best_model_valid = train(ae, optim, args.epochs, loader_t, loader_v, noise=args.noise if args.cwt is None else None)
     print(f"MEDACC: {np.median(accs)}")
+    print(f"MAXACC: {np.max(accs)}")
 
 
     fig, (ax1, ax2) = plt.subplots(2, 1)

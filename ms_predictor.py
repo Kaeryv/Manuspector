@@ -18,48 +18,47 @@ parser.add_argument("-wd", type=float, default=1e-1)
 parser.add_argument("-seed", type=int, default=42)
 parser.add_argument("-noise", type=float, default=0.0)
 parser.add_argument("-action", type=str, default="train")
+parser.add_argument("-wlmin", type=float, default=200)
+parser.add_argument("-wlmax", type=float, default=2300)
 args = parser.parse_args()
 
+
+from copy import deepcopy
 import torch
 from glob import glob
 import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
+import numpy as np
+from scipy.signal import savgol_filter
 from misc import data_augment, count_parameters, torchify
 from dataset import load_spectral_data, dataset_dict_to_dense, augment_mix
-
+from pywt import cwt
 np.random.seed(args.seed*543246)
 
 
-dev = torch.device("cpu")
-
-import torch
-
-    
+dev = torch.device("mps")
 
 
-# Training data
-from scipy.signal import savgol_filter
 validation_indices = list()
+# Training data
 with open("data.txt") as f:
-    lines = f.read().splitlines()
-    sources = list()
-    for line in lines:
-        if "VALIDATION" in line:
-            validation_indices.extend(map(int, line.split()[1:]))
-        if not line.startswith("#"):
-            sources.append(line)
+    sources = f.read().splitlines()
+    # Find historical samples
+    for s in sources:
+        if "VALIDATION" in s:
+            validation_indices = list(map(int, s.split()[1:]))
+    sources = [ s for s in sources if  not s.startswith("#")]
     dataset_dict = load_spectral_data(sources, verbose=True)
 
+names = list(dataset_dict.keys())
 # We label the dataset and convert it to numpy arrays
 X, Y = dataset_dict_to_dense(dataset_dict)
-histo_mask = np.zeros_like(Y[:, 0], dtype=bool)
-for v in validation_indices:
-    histo_mask |= (Y[:, 0] == v)
+
 # Build the wavelength vector
 wavelength = np.flipud(np.linspace(250, 2500, 226))
 # Wavelengths above 2300nm are removed because of low SNR
-wl_mask = wavelength <= 2300
+wl_mask = (wavelength <= args.wlmax) & (wavelength >= args.wlmin)
 X = X[:, wl_mask]
 wavelength = wavelength[wl_mask]
 
@@ -81,24 +80,25 @@ if args.action =="savgol":
 #X, Y =  augment_mix(X, Y, added=100)
 
 if args.cwt is not None:
-    from scipy.signal import cwt, ricker
     def do_cwt(data, octaves=128, offset=1, stridesf=1, stridesx=1):
+        import pywt
         cwts = list()
         for i in range(len(data)):
-            cwts.append(cwt(data[i], wavelet=ricker, widths=np.arange(offset+1, offset+octaves+1)))
-        cwts = np.asarray(cwts) / 5
-        return np.abs(cwts[:, ::stridesf, ::stridesx]).real #[:, offset:offset+octaves]
-    # augment x 
-    #X = np.asarray([ data_augment(X) for i in range(5)]).reshape(-1, X.shape[-1])
-    #valid_mask =np.tile(valid_mask, 5)
-    #Y = np.tile(Y, (5,1))
-    #print(X.shape, Y.shape)
+            cwts.append(cwt(data[i], np.arange(offset+1, offset+octaves+1), "gaus3")[0])
+        return np.array(cwts)[:, ::stridesf, ::stridesx].real
+    X1D = X.copy()
     X = do_cwt(X, octaves=args.cwt[0], offset=args.cwt[1], stridesf=args.cwt[2], stridesx=args.cwt[3])
 
 # StandardScaling
-dsmean = X.mean(axis=0)
-dsstd = X.std(axis=0) * 2
+dsmean = X.mean(axis=(0))
+dsstd = X.std(axis=(0)) * 2
 X = (X - dsmean) / dsstd
+
+histo_mask = np.zeros_like(Y[:, 0], dtype=bool)
+for v in validation_indices:
+    histo_mask |= (Y[:, 0] == v)
+
+use_histo_in_classif = False
 
 if args.validation == "historical":
     # Separate every single historic parchment and put them in validation (sets 12 and 13).
@@ -108,16 +108,24 @@ if args.validation == "historical":
     Yv = Y[valid_mask]
     Xt = X[~valid_mask]
     Yt = Y[~valid_mask]
+elif args.validation == "all":
+    use_histo_in_classif=True
+    Xv = X.copy()
+    Yv = Y.copy()
+    Xt = X.copy()
+    Yt = Y.copy()
+    valid_mask = np.ones_like(histo_mask)
 
 elif args.validation == "historical+":
     # Separate every single historic parchment and put them in validation (sets 12 and 13).
-    valid_mask = np.logical_or(Y[:, 0] == 13, Y[:, 0] == 12)
+    valid_mask = histo_mask
     # Train/Test split
     Xv = X[valid_mask]
     Yv = Y[valid_mask]
     Xt = X.copy()
     Yt = Y.copy()
 elif args.validation == "segment":
+    use_histo_in_classif=True
     # will be used for k-fold
     validation_ids = np.arange(len(Y))
     np.random.shuffle(validation_ids)
@@ -129,22 +137,41 @@ elif args.validation == "segment":
     Xt = X[~valid_mask]
     Yt = Y[~valid_mask]
 
+names_validation = list()
+names_training = list()
+for i, is_validaton in enumerate(valid_mask):
+    if is_validaton:
+        names_validation.append(names[i])
+        if args.validation == "historical+":
+            names_training.append(names[i])
+    else:
+        names_training.append(names[i])
+
 if args.cwt:
     img_shape = (X.shape[1],X.shape[2])
-del X, Y
+#del X, Y
 
 # Limit samples per parchment
-Xt = Xt[Yt[:,5]< args.max_samples,:]
-Yt = Yt[Yt[:,5]< args.max_samples,:]
+sample_limiter = Yt[:,5]< args.max_samples
+Xt = Xt[sample_limiter,:]
+Yt = Yt[sample_limiter,:]
 
-Xv = Xv[Yv[:,5]< 4,:]
-Yv = Yv[Yv[:,5]< 4,:]
+if len(names_training) > 0:
+    names_training = [ names_training[i] for i, is_included in enumerate(sample_limiter) if is_included ]
+
+sample_limiter = Yv[:,5]< 4
+Xv = Xv[sample_limiter,:]
+Yv = Yv[sample_limiter,:]
+
+names_validation = [ names_validation[i] for i, is_included in enumerate(sample_limiter) if is_included ]
+
 
 labels_t = Yt[:, 1]
 labels_v = Yv[:, 1]
 
 
-print("Samples per class: ", [np.count_nonzero(labels_t == i) for i in range(3)])
+print("Samples per class [t]: ", [np.count_nonzero(labels_t == i) for i in range(3)])
+print("Samples per class [v]: ", [np.count_nonzero(labels_v == i) for i in range(3)])
 
 
 from torch.utils.data import TensorDataset, DataLoader
@@ -156,6 +183,7 @@ loader_v = DataLoader(TensorDataset(torchify(Xv, cc=1), torchify(labels_v, torch
 
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 
 import torch.nn as nn
 class WaveletAutoEncoder(nn.Module):
@@ -163,28 +191,44 @@ class WaveletAutoEncoder(nn.Module):
         super(WaveletAutoEncoder, self).__init__()
         c = complexity
         self.conv = nn.Sequential(
-            nn.Conv2d(1    , 1 * c, 5, 2),
-            nn.LeakyReLU(0.0, True),
+            # Layer 1
+            # Maxpool smaller : SMP old = 5 3 3
+            nn.Conv2d(1, 1 * c, 5, padding="valid"),
+            nn.MaxPool2d(2, (1, 2)),
+            nn.Tanh(),
             nn.Dropout2d(dropout),
-            nn.Conv2d(1 * c, 2 * c, 5, (1,2)),
-            nn.LeakyReLU(0.0, True),
-            nn.Conv2d(2 * c, 4 * c, 5, (1,2)),
+            nn.BatchNorm2d(1*c),
+            # Layer 2
+            nn.Conv2d(1 * c, 2 * c, 3, padding="valid"),
+            nn.MaxPool2d(2, (1,2)),
+            nn.ReLU(),
+            nn.Dropout2d(dropout),
+            nn.BatchNorm2d(2*c),
+            # Layer 3
+            nn.Conv2d(2 * c, 4 * c, 3, padding="valid"),
+            nn.MaxPool2d(2, (1,2)),
             nn.Tanh(),
         )
         self.deconv = nn.Sequential(
-            nn.ConvTranspose2d(c * 4, c * 2, 5, (1,2)),
-            nn.LeakyReLU(0.2, True),
-            nn.ConvTranspose2d(c * 2, c * 1, 5, (1,2)),
-            nn.LeakyReLU(0.2, True),
-            nn.ConvTranspose2d(c * 1,  1, 5, 2),
+            # Layer 1
+            nn.Upsample(scale_factor=(1,2)),
+            nn.Conv2d(c * 4, c * 2, 3, 1),
+            nn.Tanh(),
+            # Layer 2
+            nn.Upsample(scale_factor=(1,2)),
+            nn.Conv2d(c * 2, c * 1, 3, 1),
+            nn.Tanh(),
+            # Layer 3
+            nn.Upsample(scale_factor=(1,2)),
+            nn.Conv2d(c * 1,  1, 5, 1),
             nn.Upsample(img_shape)
         )
-        size = self.conv(torch.randn(1,1, img_shape[0], img_shape[1])).shape
+        size = self.conv(torch.zeros(1,1, img_shape[0], img_shape[1])).shape
         self.dense = nn.Sequential(
-            nn.Linear(complexity*4*size[2]*size[3], 64),
-            nn.LeakyReLU(0.2, True),
-            nn.Linear(64, 3),
-            nn.LogSoftmax(1)
+            nn.Linear(complexity*4*size[2]*size[3], 128),
+            nn.ReLU(),
+            nn.Linear(128, 3),
+            #nn.LogSoftmax(1)
         )
     
     def forward(self, X):
@@ -192,7 +236,7 @@ class WaveletAutoEncoder(nn.Module):
         X = self.conv(X)
         C = self.dense(X.reshape(bs, -1))
         Y = self.deconv(X)
-        return Y, C
+        return Y, F.log_softmax(C, 1)
 
 
 
@@ -240,23 +284,26 @@ class ConvolutionalAutoEncoder(nn.Module):
         return X
 
 if args.cwt is None:
-    ae = ConvolutionalAutoEncoder(len(wavelength), out_classes=3, complexity=args.complexity, latent_space=args.latent, dropout=args.dropout)
+    ae = ConvolutionalAutoEncoder(len(wavelength), out_classes=3, 
+                                  complexity=args.complexity, latent_space=args.latent, 
+                                  dropout=args.dropout, kernel_base=13)
 else:
     ae = WaveletAutoEncoder(complexity=args.complexity, dropout=args.dropout)
 ae.to(dev)
 print("PARAMETERS", count_parameters(ae))
 
-from torch.optim import Adam
+from torch.optim import Adam, SGD
 import torch.nn as nn
 from torch.optim.lr_scheduler import StepLR
 from tqdm import trange
+from copy import copy
 
-optim = Adam(ae.parameters(), lr=args.lr, weight_decay=args.wd)
 
-def accuracy(prediction, ground_truth):
-    return np.count_nonzero(np.argmax(prediction, 1) == ground_truth) / len(ground_truth)
+def count_correct(prediction, ground_truth):
+    return np.count_nonzero(np.argmax(prediction, 1) == ground_truth)
 
-def train(model, optim, num_epochs, loader_t, loader_v, noise=None, dont_train_classif_on_historic=True):
+def train(model, num_epochs, loader_t, loader_v, noise=None, dont_train_classif_on_historic=True):
+    optim = SGD(model.parameters(), lr=args.lr, weight_decay=args.wd)
     best_model = None
     best_model_valid = 0.0
     mse_loss = nn.MSELoss()
@@ -268,23 +315,32 @@ def train(model, optim, num_epochs, loader_t, loader_v, noise=None, dont_train_c
     accs = list()
     for e in progress:
         epoch_loss = 0.0
+        epoch_recons_loss = 0.0
         model.train()
         for x, y, z  in loader_t:
             bs = x.shape[0]
             ds = x.shape[1]
-            if noise is not None:
-                X_noisy = torchify(data_augment(x.numpy()), cc=1)
-                X_noisy = x + torch.randn(bs, 1, ds) * noise
-                X_noisy = X_noisy.reshape(bs, 1, -1)
-                x = x.reshape(bs, 1, -1)
+            # if noise is not None:
+            #     X_noisy = torchify(data_augment(x.numpy()), cc=1)
+            #     X_noisy = x + torch.randn(bs, 1, ds) * noise
+            #     X_noisy = X_noisy.reshape(bs, 1, -1)
+            #     x = x.reshape(bs, 1, -1)
+            #     #X_noisy = x + torch.randn(x.shape) * 0.05
+            # else:
+            #     X_noisy = x
+
+            if args.noise > 0.0:
+                X_noisy = x * (1.0 + torch.randn(1)*0.5)
+                X_noisy = X_noisy + torch.randn(x.shape) * 0.05
             else:
                 X_noisy = x
-                
             optim.zero_grad()
             xr, yp = model(X_noisy.to(dev))
             recons_loss = mse_loss(xr.cpu(), x)
             if dont_train_classif_on_historic:
-                is_historical = torch.logical_or(z==12, z==13)
+                is_historical = torch.zeros_like(z).type(torch.bool)
+                for v in validation_indices:
+                    is_historical |= (z==v)
                 if torch.all(is_historical):
                     classif_loss = 0.0
                 else:
@@ -296,57 +352,76 @@ def train(model, optim, num_epochs, loader_t, loader_v, noise=None, dont_train_c
             loss.backward()
             optim.step()
             epoch_loss += loss.cpu().item()
+            epoch_recons_loss += recons_loss.cpu().item()
         with torch.no_grad():
             model.eval()
             epoch_loss_t = 0.0
-            mean_acc = 0.0
+            correct_samples = 0
             for x, y in loader_v:
                 bs = x.shape[0]
-                xp, yp = ae(x.to(dev))
+                _, yp = model(x.to(dev))
                 loss = nll_loss(yp.cpu(), y)
                 epoch_loss_t += loss.item()
-                mean_acc += accuracy(yp.cpu().detach().numpy(), y.detach().numpy())
+                correct_samples += count_correct(yp.cpu().detach().numpy(), y.detach().numpy())
             epoch_loss_t /= len(loader_v)
-            mean_acc /= len(loader_v)
+            mean_acc = correct_samples / len(Yv)
             losses_t.append(epoch_loss_t)
             accs.append(mean_acc)
 
         if mean_acc >= best_model_valid:
-            best_model = ae.state_dict().copy()
-            best_model_valid = mean_acc
+            best_model = deepcopy(ae.state_dict())
+            best_model_valid = copy(mean_acc)
+        
+        if e % 5 == 0:
+            fig, (ax1, ax2) = plt.subplots(2, 1)
+            ax1.plot(losses_t, label="Training loss", color="r")
+            ax1.set_ylabel("T. Classif+Recons loss")
+            ax1b = ax1.twinx()
+            ax1b.set_ylabel("V. Classif loss")
+            ax1b.plot(losses_t, label="Validation loss", color="b")
+            ax2.plot(accs, color="g", label="Accuracy" )
+            ax2.axhline(np.max(accs), color="green")
+            ax2.set_ylim(0, 1)
+            plt.legend()
+            plt.savefig(args.chart_file)
 
 
         epoch_loss /= len(loader_t)
+        epoch_recons_loss /= len(loader_t)
         progress.set_description(f"epoch {e} loss {round(epoch_loss, 4)} valid {round(epoch_loss_t, 5)}, acc {round(mean_acc, 3)} ")
-        losses.append(epoch_loss)
+        losses.append((epoch_loss, epoch_recons_loss))
 
-    ae.load_state_dict(best_model)
+    model.load_state_dict(best_model)
 
-    return losses, losses_t, accs, best_model_valid
+    return losses, losses_t, accs, best_model_valid, optim
 
 
 if args.action == "train":
     print("Training model")
-    losses, losses_t, accs, best_model_valid = train(ae, optim, args.epochs, loader_t, loader_v, noise=args.noise if args.cwt is None else None)
+    losses, losses_t, accs, best_model_valid, optim = train(ae, args.epochs, loader_t, loader_v, noise=args.noise if args.cwt is None else None, dont_train_classif_on_historic=not use_histo_in_classif)
     print(f"MEDACC: {np.median(accs)}")
     print(f"MAXACC: {np.max(accs)}")
-
+    print(f"ENDACC: {accs[-1]}")
+    losses = np.asarray(losses)
 
     fig, (ax1, ax2) = plt.subplots(2, 1)
-    ax1.plot(losses, label="Training loss")
+    ax1.plot(losses[:,0], label="Training loss", color="r")
+    ax1.plot(losses[:,1], label="Recons loss", color="k")
     ax1.set_ylabel("T. Classif+Recons loss")
     ax1b = ax1.twinx()
     ax1b.set_ylabel("V. Classif loss")
-    ax1b.plot(losses_t, label="Validation loss")
-    ax2.plot(accs, color="g", label="Accuracy")
+    ax1b.plot(losses_t, label="Validation loss", color="b")
+    ax2.plot(accs, color="g", label="Accuracy" )
     ax2.axhline(best_model_valid, color="green")
     print(np.min(losses_t))
     ax2.set_ylim(0, 1)
+    plt.legend()
     plt.savefig(args.chart_file)
     torch.save({
-        "model": ae.state_dict(), 
-        "optim": optim, 
-        "losses": losses, 
+        #"model": ae.state_dict(), 
+        #"optim": optim, 
+        "losses": losses[:,0], 
+        "lrecons": losses[:,1], 
         "accs": accs, 
         "losses_t": losses_t,
         "num_parameters": count_parameters(ae),
@@ -365,3 +440,147 @@ elif args.action == "augment":
         axs.plot(xaug[0,0])
     plt.show()
 
+elif args.action == "shapley":
+    print("Computing shapley values")
+    import shap
+    weights = torch.load(args.model_file)["model"]
+    ae.load_state_dict(weights)
+    print("Loaded model")
+    def forward(X):
+        X = do_cwt(X, octaves=args.cwt[0], offset=args.cwt[1], stridesf=args.cwt[2], stridesx=args.cwt[3])
+        X = (X - dsmean) / dsstd
+        _, yp = ae(torchify(X, cc=1).to(dev))
+        return yp
+
+    background = X1D[np.random.choice(len(X1D), size=min(150, len(X1D)))]
+    print(background.shape)
+    explainer = shap.explainers.Permutation(forward, background)
+    print("SHAP Loaded")
+    sample = np.random.choice(len(X1D), size=4)
+    print(X1D[sample].shape)
+    shap_values = explainer(X1D[sample])
+    labels = Y[sample,1]
+    print(shap_values.shape)
+    np.savez("shap_values.npz", values=shap_values.values, base=shap_values.base_values, data=shap_values.data, labels=labels)
+
+
+elif args.action == "shapley_cwt":
+    print("Computing shapley values of CWT")
+    import shap
+    weights = torch.load(args.model_file)["model"]
+    ae.load_state_dict(weights)
+    print("Loaded model")
+    downsampling = 1
+    # Create a dummy model that only outputs classification
+    class ClassifModel(nn.Module):
+        def __init__(self, base) -> None:
+            super(ClassifModel, self).__init__()
+            self.base = base
+            self.base.eval()
+        def forward(self, X):
+            print(X.shape)
+            X = nn.Upsample(scale_factor=downsampling)(X)
+            _, yp = self.base(X.to(dev))
+            return yp #torch.exp(yp).clone()
+
+    model = ClassifModel(ae)
+    indices_background = np.random.choice(len(Xt), size=min(200, len(X1D)))
+    background = torchify(Xt[indices_background],cc=1)
+    background = nn.Upsample(scale_factor=1/downsampling)(background)
+    
+    # Using the SHAP DeepExplainer
+    explainer = shap.explainers.DeepExplainer(model, background)
+    sample = np.random.choice(len(background), size=100)
+    Xshap = background[sample]
+    shap_values = explainer.shap_values(Xshap,check_additivity=False)
+
+    labels = Yt[sample,1]
+    shap_values = np.asarray(shap_values)
+    np.savez_compressed(f"shapley_data/shap_values_{args.seed}.npz", values=shap_values, data=Xshap.numpy(), labels=Yt[sample], spectra=X1D[sample], background=background[sample].numpy())
+
+
+
+elif args.action == "predict":
+    weights = torch.load(args.model_file)["model"]
+    ae.load_state_dict(weights)
+    ae.eval()
+    #ae.conv[4].momentum = 0.0
+    #ae.conv[4].track_running_stats=True
+    #ae.conv[9].momentum = 0.0
+    #ae.conv[9].track_running_stats=True
+    #print(ae.conv[4])
+    #print(ae.conv[9])
+    #exit()
+    val_spectra = torchify(Xv, cc=1)
+    with torch.no_grad():
+        mean_acc = 0.0
+        xp, yp = ae(val_spectra.to(dev))
+        preds = yp.detach().numpy()
+        preds = np.argmax(preds, axis=1)
+        print("ACC:", np.count_nonzero(preds==Yv[:,1])/len(Yv)*100, "%")
+    
+    with torch.no_grad():
+        epoch_loss_t = 0.0
+        correct_samples = 0
+        for x, y in loader_v:
+            bs = x.shape[0]
+            xp, yp = ae(x.to(dev))
+            correct_samples += count_correct(yp.cpu().detach().numpy(), y.detach().numpy())
+        epoch_loss_t /= len(loader_v)
+        mean_acc = correct_samples / len(Yv)
+    print(mean_acc)
+    exit()
+    confusion_matrix = np.zeros((3,3))
+    for pred, real in zip(preds, Yv[:,1]):
+        confusion_matrix[pred, real] += 1
+    import matplotlib.pyplot as plt
+    from dataset import species
+    fig, ax = plt.subplots()
+    ax.matshow(confusion_matrix)
+    for (i, j), z in np.ndenumerate(confusion_matrix):
+        ax.text(j, i, '{:0.1f}'.format(z), ha='center', va='center')
+    ax.set_xticks(np.arange(3), species)
+    ax.set_yticks(np.arange(3), species)
+    fig.savefig("Figures/confusion.png")
+    histo_mask = Yv[:,0] == validation_indices[0]
+    for v in validation_indices:
+        histo_mask |= (Yv[:,0]==v)
+    print("Historical samples count: ", np.count_nonzero(histo_mask))
+    print("ACC:", np.count_nonzero(preds[histo_mask]==Yv[histo_mask,1])/np.count_nonzero(histo_mask)*100, "%")
+
+    fig, axs = plt.subplots(10,5, figsize=(5,2))
+    axs1 = axs.flatten()[:25]
+    axs2 = axs.flatten()[25:]
+    xp = xp.detach()[:len(axs1),0].numpy()
+    vs = val_spectra.detach()[:len(axs),0].numpy()
+
+    print("PREDVMIN", np.min(xp))
+    print("PREDVMAX", np.max(xp))
+    print("TRUEVMIN", np.min(vs))
+    print("TRUEVMAX", np.max(vs))
+    
+    vmax = np.max(np.abs(vs))
+    for i, ax in enumerate(axs1):
+        ax.contourf(xp[i], vmin=-vmax, vmax=vmax)
+        ax.axis("equal")
+        ax.axis("off")
+    plt.subplots_adjust(hspace=0.1)
+    for i, ax in enumerate(axs2):
+        ax.contourf(val_spectra.detach()[i,0].numpy(), vmin=-vmax, vmax=vmax)
+        ax.axis("off")
+    fig.savefig("Figures/reconstruction.png")
+    fig.savefig("Figures/reconstruction.pdf")
+elif args.action =="tsne":
+    print("TSNEing")
+    from sklearn.manifold import TSNE
+    model = TSNE(2, perplexity=50)
+    print(Xt.shape)
+    Xtsne = model.fit_transform(Xt)
+    import matplotlib.pyplot as plt
+    histo_mask = Yt[:,0] == validation_indices[0]
+    for v in validation_indices:
+        histo_mask |= (Yt[:,0]==v)
+    plt.scatter(*Xtsne[histo_mask].T, c=Yt[histo_mask,1])
+    plt.scatter(*Xtsne[~histo_mask].T, c=Yt[~histo_mask,1], marker="+")
+    plt.savefig("test2.png")
+    print(Xtsne.shape)

@@ -1,0 +1,17 @@
+VALIDATION 12 13 15 16 19
+./raw_data/DataDavid/UVVIS/*.asc
+./raw_data/DataHenry23/Perkin/New_*/*.asc
+./raw_data/DataJulie/07_09_spectro/**/*.asc
+./raw_data/DataJulie/14_09_2023/*.asc
+./raw_data/DataJulie/11_09_2023/*.asc
+./raw_data/DataJulie/14_09_2023_histo/*.asc
+./raw_data/DataJulie/historique/*.asc
+./raw_data/DataNicolas/08_01_2024/*.asc
+./raw_data/DataNicolas/09_01_2024/*.asc
+#./raw_data/DataNicolas/11_01_2024/006-*.asc
+./raw_data/DataNicolas/11_01_2024/015-*.asc
+./raw_data/DataNicolas/11_01_2024/016-*.asc
+./raw_data/DataNicolas/17_01_2024/017-*NR006*.asc
+./raw_data/DataNicolas/17_01_2024/017-*NR005*.asc
+./raw_data/DataNicolas/19_01_2024/018-*.asc
+#./raw_data/DataNicolas/19_01_2024/019-*.asc

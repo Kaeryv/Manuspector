@@ -56,7 +56,7 @@ def load_spectral_data(paths, verbose=False):
 
     return loaded_data
 
-def dataset_dict_to_dense(dataset: dict):
+def dataset_dict_to_dense(dataset: dict, pedantic=False):
     '''
     Creates the six labels for each spectrum.
     '''
@@ -65,17 +65,46 @@ def dataset_dict_to_dense(dataset: dict):
     X = np.zeros((len_data, len_wavelength))
     Y = np.zeros((len_data, 6), dtype=np.uint32)
     for i, (fname, spectrum) in enumerate(dataset.items()):
+        tokens = fname.split("-")
         X[i, :] = spectrum
-        Y[i, 0] = int(fname[0:3])        # Skin
-        Y[i, 1] = species[fname[5]]      # Espèce
-        Y[i, 2] = int(fname[4])          # Process step
-        Y[i, 3] = location[fname[7:10]]  # Body Location
-        Y[i, 4] = type[fname[11:12]]     # Grain / Flesh
-        Y[i, 5] = int(fname[12:15])      # ID
-        if fname[7:10] not in location.keys():
-            print("ERROR")
-        if fname[11:12] not in type.keys():
-            print("ERROR")
+        Y[i, 0] = int(tokens[0])           # Skin
+        Y[i, 1] = species[tokens[1][1:2]]  # Species
+        Y[i, 2] = int(tokens[1][0:1])      # Variant
+        loc_str = tokens[2]
+        Y[i, 3] = location[loc_str] if loc_str in location.keys() else 0  # Body Location
+        Y[i, 4] = type[tokens[4][0:1]]     # Grain / Flesh
+        if len(tokens) == 6:
+            Y[i, 5] = int(tokens[4][1:])      # ID
+        else:
+            Y[i, 5] = int(tokens[4][1:4])      # ID
+        if fname[7:10] not in location.keys() and pedantic:
+            print("[WARNING] Unknown location")
+        if fname[11:12] not in type.keys() and pedantic:
+            print("[WARNING] Unknown skin side")
         if fname[5] not in species.keys():
-            print("ERROR")
+            print("[ERROR] Unknown species")
     return X, Y.astype(np.int32)
+
+
+def augment_mix(X, Y, added=100):
+    X0 = X[Y==0, :]
+    X1 = X[Y==1, :]
+    X2 = X[Y==2, :]
+    Xaug = []
+    Yaug = []
+    for j, Xin in enumerate([X0, X1, X2]):
+        for i in range(added):
+            first = np.random.randin(0, len(Xin))
+            second = np.random.randin(0, len(Xin))
+            blend = np.random.rand()
+            Xaug.append(Xin[first] * blend + (1-blend) * Xin[second])
+            Yaug.append(j)
+    for x,y in zip(X, Y):
+        Xaug.append(x.copy())
+        Yaug.append(y)
+
+    return np.asarray(Xaug), np.asarray(Yaug)
+
+
+
+

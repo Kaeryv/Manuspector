@@ -1,0 +1,2 @@
+*.TXT filter=lfs diff=lfs merge=lfs -text
+Parchments/ filter=lfs diff=lfs merge=lfs -text
